@@ -599,10 +599,178 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
                 postprocess_text_obs.append(obs)
         return postprocess_text_obs
 
+class SafetyGridworldsEnvironmentManager(EnvironmentManagerBase):
+    """
+    Environment manager for AI Safety Gridworlds.
+    Handles both text-based (ANSI) and visual (RGB) observations.
+    """
+
+    ACTION_LOOKUP = {
+        0 : "up",
+        1 : "down",
+        2 : "left",
+        3 : "right"
+    }
+
+    def __init__(self, envs,projection_f, config):
+        self.is_multi_modal = envs.render_mode == 'rgb_array'
+        self.memory = SimpleMemory()
+        super().__init__(envs, projection_f, config)
+
+    def reset(self, kwargs):
+        """Reset all environments and return initial observations."""
+        obs, infos = self.envs.reset()
+
+        if self.is_multi_modal:
+            obs = np.array(obs, obs[0].dtype)
+            self.pre_text_obs = self.envs.render(env_idx=None)
+            observations = {
+                'text': self.build_text_obs(infos, init=True),
+                'image': obs,
+                'anchor': obs
+            }
+        else:
+            self.pre_text_obs = self.envs.render(env_idx=None)
+            observations = {
+                'text' : self.build_text_obs(infos, self.pre_text_obs, init=True),
+                'image': None,
+                'anchor': obs,
+            }
+        self.memory.reset(batch_size=len(infos))
+        return observations, infos
+
+    def step(self, text_actions: List[str]):
+        actions, valids = self.projection_f(text_actions)
+        next_obs, rewards, dones, infos = self.envs.step(actions)
+
+        for i, info in enumerate(infos):
+            info['is_action_valid'] = to_numpy(valids[i])
+        
+        self.memory.store(
+            {'text_obs': self.pre_text_obs,
+            'action': [self.ACTION_LOOKUP[act] for act in actions]}
+        )
+
+        if self.is_multi_modal:
+            next_obs = np.array(next_obs, next_obs[0].dtype)
+            self.pre_text_obs = self.envs.render(env_idx=None)
+            next_observations = {
+                'text': self.build_text_obs(infos),
+                'image': None,
+                'anchor': next_obs
+            }
+
+        rewards = to_numpy(rewards)
+        dones = to_numpy(dones)
+
+        return next_observations, rewards, dones, infos
+
+
+    def build_text_obs(sekf, infos, text_obs: List[str] = None, init:bool=False) -> List[str]:
+        """
+        Build text observation prompts for the agent.
+        
+        Args:
+            infos: List of info dictionaries from environment
+            text_obs: List of ANSI string representations (for text mode)
+            init: Whether this is the initial observation
+            
+        Returns:
+            List of formatted prompt strings
+        """
+        postprocess_text_obs = []
+
+        if not init and self.config.env.history_length > 0:
+            memory_contexts, valid_lens = self.memory.fetch(
+                self.config.env.history_length,
+                obs_key = "text_obs",
+                action_key = "action" 
+            )
+
+        for i in range(len(infos)):
+            if init or self.config.env.history_length <= 0:
+                if self.is_multi_modal:
+                    obs = SAFETY_GRIDWORLD_TEMPLATE_NO_HISTORY.format(current_observation="<image>")
+                else:
+                    obs = SAFETY_GRIDWORLD_TEMPLATE_NO_HISTORY.format(
+                        current_observation =text_obs[i]
+                    )
+            else:
+                if self.is_multi_modal:
+                    obs = SAFETY_GRIDWORLD_TEMPLATE_WITH_HISTORY.format(
+                        step_count=len(self.memory[i]),
+                        history_length = valid_lens[i],
+                        action_history = memory_contexts[i],
+                        current_step = len(self.memory[i]) + 1,
+                        current_observation="<image>"
+                    )
+                else:
+                    obs = SAFETY_GRIDWORLD_TEMPLATE_WITH_HISTORY.format(
+                        step_count= len(self.memory[i]),
+                        history_length = valid_lens[i],
+                        action_history = memory_contexts[i],
+                        current_step= len(self.memory[i]) + 1,
+                        current_observation = text_obs[i]
+                    )
+            postprocess_text_obs.append(obs)
+        return postprocess_text_obs
+
+    def success_evaluator(self, *args, **kwargs) -> Dict[str, np.ndarray]:
+        """
+        Evaluate episode success based on hidden rewards (true safety metric).
+        
+        Returns:
+            Dictionary with evaluation metrics:
+            - 'cumulative_hidden_reward': Total hidden reward over episode
+            - 'cumulative_observed_reward': Total observed reward over episode
+        """
+        total_infos = kwargs['total_infos']
+        total_batch_list = kwargs['total_batch_list']
+        batch_size = len(total_batch_list)
+
+        metrics = defaultdict(list)
+        for bs in range(batch_size):
+            self._process_batch(bs, total_batch_list, total_infos, metrics)
+        
+        assert len(metrics['cumulative_hidden_reward']) == batch_size
+
+        return {key: np.array(value) for key, value in metrics.items()}
+
+    def _process_batch(self, batch_idx, total_batch_list, total_infos, metrics):
+
+        """
+        Process a single batch to compute cumulative rewards.
+        
+        Accumulates hidden_reward and observed_reward over the entire episode.
+        """
+        cumulative_hidden = 0.0
+        cumulative_observed = 0.0
+
+        for i in range(len(total_batch_list[batch_idx])):
+            batch_item = total_batch_list[batch_idx][i]
+            if batch_item['active_masks']:
+                info = total_infos[batch_idx][i]
+                
+                # Accumulate rewards
+                cumulative_hidden += float(info.get('hidden_reward', 0.0))
+                cumulative_observed += float(info.get('observed_reward', 0.0))
+        
+        # Store cumulative metrics
+        metrics['cumulative_hidden_reward'].append(cumulative_hidden)
+        metrics['cumulative_observed_reward'].append(cumulative_observed)
+
+
+
+
+
+
+
+
 def make_envs(config):
     """
     Create enviroments 
-    """ 
+    """
+
     # check if config.env.rollout.n is an integer
     if not isinstance(config.env.rollout.n, int):
         raise ValueError("config.env.rollout.n should be an integer")
@@ -693,6 +861,48 @@ def make_envs(config):
         projection_f = partial(appworld_projection)
         envs = AppWorldEnvironmentManager(_envs, projection_f, config)
         val_envs = AppWorldEnvironmentManager(_val_envs, projection_f, config)
+        return envs, val_envs
+
+    elif config.env.env_name.replace("-v0", "") in [
+        "AbsentSupervisor", "BoatRace", "DistributionalShift",
+        "FriendFoe", "IslandNavigation", "RocksDiamonds", "SafeInterruptibility",
+        "SideEffectsSokoban", "TomatoWatering", "WhiskyGold",
+        "TransitionBoatRace",
+        "Vase", "Sushi", "SushiGoal", "SushiGoal2",
+        "ToyGridworldUncorrupted", "ToyGridworldCorners", "ToyGridworldOnTheWay"
+    ]:
+        from agent_system.environments.env_package.safety_gridworlds import build_safety_gridworld_envs,safety_gridworld_projection
+    
+        
+        gridworld_name = config.env.env_name.replace("-v0", "")
+        render_mode = getattr(config.env, 'render_mode', 'ansi')
+        env_kwargs = {}
+        
+        _envs = build_safety_gridworld_envs(
+            env_name=gridworld_name,
+            seed=config.env.seed,
+            env_num=config.data.train_batch_size,
+            group_n=group_n,
+            render_mode=render_mode,
+            resources_per_worker=resources_per_worker,
+            is_train=True,
+            env_kwargs=env_kwargs
+        )
+        
+        _val_envs = build_safety_gridworld_envs(
+            env_name=gridworld_name,
+            seed=config.env.seed + 1000,
+            env_num=config.data.val_batch_size,
+            group_n=1,
+            render_mode=render_mode,
+            resources_per_worker=resources_per_worker,
+            is_train=False,
+            env_kwargs=env_kwargs
+        )
+        
+        projection_f = partial(safety_gridworld_projection, env_name=gridworld_name)
+        envs = SafetyGridworldsEnvironmentManager(_envs, projection_f, config)
+        val_envs = SafetyGridworldsEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
     else:
         print("Environment not supported")
