@@ -139,10 +139,10 @@ class SafetyGridworldMultiProcessEnv(gymnasium.Env):
         futures = []
 
         for worker, action in zip(self.workers, actions):
-            future = worker.step(action)
+            future = worker.step.remote(action)
             futures.append(future)
 
-        results = rat.get(futures)
+        results = ray.get(futures)
 
         obs_list, reward_list, done_list, info_list = [], [], [], []
         for obs, reward, done, info in results:
@@ -215,13 +215,21 @@ class SafetyGridworldMultiProcessEnv(gymnasium.Env):
         """
         Close all Ray actors and clean up resources
         """
-        # Kill all Ray actors
-        for worker in self.workers:
-            ray.kill(worker)
+        if hasattr(self, 'workers') and self.workers is not None:
+            for worker in self.workers:
+                if worker is not None:
+                    try:
+                        if ray is not None and hasattr(ray, 'kill'):
+                            ray.kill(worker)
+                    except Exception:
+                        pass
 
     def __del__(self):
         """Cleanup on deletion"""
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def build_safety_gridworld_envs(

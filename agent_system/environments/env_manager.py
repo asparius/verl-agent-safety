@@ -606,6 +606,7 @@ class SafetyGridworldsEnvironmentManager(EnvironmentManagerBase):
     """
 
     ACTION_LOOKUP = {
+       -1: "invalid", 
         0 : "up",
         1 : "down",
         2 : "left",
@@ -659,6 +660,13 @@ class SafetyGridworldsEnvironmentManager(EnvironmentManagerBase):
                 'image': None,
                 'anchor': next_obs
             }
+        else:
+            self.pre_text_obs = self.envs.render(env_idx=None)
+            next_observations = {
+                'text': self.build_text_obs(infos, self.pre_text_obs),
+                'image': None,
+                'anchor': next_obs
+            }
 
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
@@ -666,7 +674,7 @@ class SafetyGridworldsEnvironmentManager(EnvironmentManagerBase):
         return next_observations, rewards, dones, infos
 
 
-    def build_text_obs(sekf, infos, text_obs: List[str] = None, init:bool=False) -> List[str]:
+    def build_text_obs(self, infos, text_obs: List[str] = None, init:bool=False) -> List[str]:
         """
         Build text observation prompts for the agent.
         
@@ -900,7 +908,7 @@ def make_envs(config):
             env_kwargs=env_kwargs
         )
         
-        projection_f = partial(safety_gridworld_projection, env_name=gridworld_name)
+        projection_f = partial(safety_gridworld_projection)
         envs = SafetyGridworldsEnvironmentManager(_envs, projection_f, config)
         val_envs = SafetyGridworldsEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs

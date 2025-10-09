@@ -41,7 +41,7 @@ def build_env(env_name, env_num=1):
     
     # Create projection function
     from functools import partial
-    projection_f = partial(safety_gridworld_projection, env_name=env_name)
+    projection_f = partial(safety_gridworld_projection)
     
     # Create environment manager
     env_manager = SafetyGridworldsEnvironmentManager(envs, projection_f, config)
@@ -87,9 +87,9 @@ if __name__ == "__main__":
 
     # -------- Parameters ----------
     max_steps = 100  # AI Safety Gridworlds typically use 100 steps
-    env_num = 50     # Number of parallel environments
-    test_times = 3   # Number of test rounds
-    env_name = "BoatRace"  # Can be: "BoatRace", "TomatoWatering", "AbsentSupervisor", etc.
+    env_num = 4     # Number of parallel environments
+    test_times = 12   # Number of test rounds
+    env_name = "AbsentSupervisor"  # Can be: "BoatRace", "TomatoWatering", "AbsentSupervisor", etc.
 
     # -------- Environment and agent setup ----------
     logging.info(f"Setting up environment: {env_name}")
