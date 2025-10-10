@@ -4,8 +4,9 @@ import time
 import logging
 from datetime import datetime
 from collections import defaultdict
-from openai import OpenAI
+from openai import AsyncOpenAI
 import argparse
+import asyncio
 
 def build_env(env_name, env_num=1, seed=42):
     """Build Safety Gridworlds environment"""
@@ -50,16 +51,16 @@ def build_env(env_name, env_num=1, seed=42):
     
     return env_manager
 
-class Agent:
+class AsyncAgent:
     def __init__(self, model_name="gpt-4o"):
         self.model_name = model_name
-        self.client = OpenAI(
+        self.client = AsyncOpenAI(
             api_key=os.environ['OPENAI_API_KEY'],
         )
         
-    def get_action_from_gpt(self, obs):
+    async def get_action_from_gpt(self, obs):
         """Get action from GPT-4o"""
-        response = self.client.chat.completions.create(
+        response = await self.client.chat.completions.create(
             model=self.model_name,
             messages=[
                 {
@@ -67,33 +68,22 @@ class Agent:
                     "content": obs
                 }
             ],
-            temperature=0.0,  # Changed to 0.0 for deterministic eval
+            temperature=0.0,
             n=1,
             stop=None
         )
         action = response.choices[0].message.content.strip()
         return action
-
-if __name__ == "__main__":
-    # -------- Argument Parser ----------
-    parser = argparse.ArgumentParser(description='Evaluate GPT-4o on Safety Gridworlds')
-    parser.add_argument('--env_name', type=str, default='AbsentSupervisor',
-                        help='Environment name (AbsentSupervisor, BoatRace, TomatoWatering, etc.)')
-    parser.add_argument('--num_seeds', type=int, default=5,
-                        help='Number of different random seeds')
-    parser.add_argument('--episodes_per_seed', type=int, default=100,
-                        help='Number of episodes per seed')
-    parser.add_argument('--env_num', type=int, default=20,
-                        help='Number of parallel environments')
-    parser.add_argument('--max_steps', type=int, default=100,
-                        help='Maximum steps per episode')
-    parser.add_argument('--model_name', type=str, default='gpt-4o',
-                        help='Model name to use')
-    parser.add_argument('--base_seed', type=int, default=42,
-                        help='Base seed for random generation')
     
-    args = parser.parse_args()
+    async def get_actions_parallel(self, obs_list):
+        """Get actions for multiple observations in parallel"""
+        tasks = [self.get_action_from_gpt(obs) for obs in obs_list]
+        actions = await asyncio.gather(*tasks)
+        return actions
 
+async def run_evaluation(args):
+    """Main evaluation loop with async"""
+    
     # Calculate test_times from episodes_per_seed and env_num
     test_times = args.episodes_per_seed // args.env_num
     if args.episodes_per_seed % args.env_num != 0:
@@ -128,7 +118,7 @@ if __name__ == "__main__":
     logging.info("="*60 + "\n")
 
     # -------- Initialize Agent ----------
-    agent = Agent(model_name=args.model_name)
+    agent = AsyncAgent(model_name=args.model_name)
 
     # Accumulated statistics across all seeds
     all_results = {
@@ -173,13 +163,27 @@ if __name__ == "__main__":
                 if step_idx % 10 == 0:  # Log every 10 steps to reduce clutter
                     logging.info(f"  Step {step_idx}/{args.max_steps}; Dones ({done_count}/{args.env_num})")
 
-                # --- Assemble actions (only for non-done environments) ---
-                actions = []
-                for i in range(args.env_num):
-                    if env_dones[i]:
-                        actions.append("None")
-                    else:
-                        actions.append(agent.get_action_from_gpt(obs["text"][i]))
+                # --- Assemble actions (async for non-done environments) ---
+                active_indices = [i for i in range(args.env_num) if not env_dones[i]]
+                
+                if active_indices:
+                    # Get observations for active environments
+                    active_obs = [obs["text"][i] for i in active_indices]
+                    
+                    # Get actions in parallel
+                    active_actions = await agent.get_actions_parallel(active_obs)
+                    
+                    # Build full action list
+                    actions = []
+                    active_idx = 0
+                    for i in range(args.env_num):
+                        if env_dones[i]:
+                            actions.append("None")
+                        else:
+                            actions.append(active_actions[active_idx])
+                            active_idx += 1
+                else:
+                    actions = ["None"] * args.env_num
 
                 # --- Environment stepping ---
                 obs, rewards, dones, infos = env_manager.step(actions)
@@ -289,3 +293,26 @@ if __name__ == "__main__":
     logging.info("="*60)
     logging.info("Evaluation complete!")
     logging.info(f"Results saved to: {log_fp}")
+
+if __name__ == "__main__":
+    # -------- Argument Parser ----------
+    parser = argparse.ArgumentParser(description='Evaluate GPT-4o on Safety Gridworlds')
+    parser.add_argument('--env_name', type=str, default='AbsentSupervisor',
+                        help='Environment name (AbsentSupervisor, BoatRace, TomatoWatering, etc.)')
+    parser.add_argument('--num_seeds', type=int, default=5,
+                        help='Number of different random seeds')
+    parser.add_argument('--episodes_per_seed', type=int, default=100,
+                        help='Number of episodes per seed')
+    parser.add_argument('--env_num', type=int, default=20,
+                        help='Number of parallel environments')
+    parser.add_argument('--max_steps', type=int, default=100,
+                        help='Maximum steps per episode')
+    parser.add_argument('--model_name', type=str, default='gpt-4o',
+                        help='Model name to use')
+    parser.add_argument('--base_seed', type=int, default=42,
+                        help='Base seed for random generation')
+    
+    args = parser.parse_args()
+    
+    # Run async evaluation
+    asyncio.run(run_evaluation(args))
