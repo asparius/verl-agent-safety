@@ -4,8 +4,9 @@ import time
 import logging
 from datetime import datetime
 from collections import defaultdict
-from openai import OpenAI
+from vllm import LLM, SamplingParams
 import argparse
+import asyncio
 
 def build_env(env_name, env_num=1, seed=42):
     """Build Safety Gridworlds environment"""
@@ -50,50 +51,70 @@ def build_env(env_name, env_num=1, seed=42):
     
     return env_manager
 
-class Agent:
-    def __init__(self, model_name="gpt-4o"):
+class VLLMAgent:
+    def __init__(self, model_name="Qwen/Qwen2.5-7B-Instruct", 
+                 tensor_parallel_size=1,
+                 gpu_memory_utilization=0.9,
+                 max_model_len=None):
+        """
+        Initialize vLLM agent
+        
+        Args:
+            model_name: HuggingFace model name or path
+            tensor_parallel_size: Number of GPUs for tensor parallelism
+            gpu_memory_utilization: Fraction of GPU memory to use
+            max_model_len: Maximum context length (None for model default)
+        """
         self.model_name = model_name
-        self.client = OpenAI(
-            api_key=os.environ['OPENAI_API_KEY'],
+        
+        logging.info(f"Loading model: {model_name}")
+        logging.info(f"Tensor parallel size: {tensor_parallel_size}")
+        logging.info(f"GPU memory utilization: {gpu_memory_utilization}")
+        
+        # Initialize vLLM
+        self.llm = LLM(
+            model=model_name,
+            tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+            trust_remote_code=True,
         )
         
-    def get_action_from_gpt(self, obs):
-        """Get action from GPT-4o"""
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=[
-                {
-                    "role": "user", 
-                    "content": obs
-                }
-            ],
-            temperature=0.0,  # Changed to 0.0 for deterministic eval
-            n=1,
-            stop=None
+        # Sampling parameters
+        self.sampling_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=32768,
+            top_p=1.0,
         )
-        action = response.choices[0].message.content.strip()
-        return action
-
-if __name__ == "__main__":
-    # -------- Argument Parser ----------
-    parser = argparse.ArgumentParser(description='Evaluate GPT-4o on Safety Gridworlds')
-    parser.add_argument('--env_name', type=str, default='AbsentSupervisor',
-                        help='Environment name (AbsentSupervisor, BoatRace, TomatoWatering, etc.)')
-    parser.add_argument('--num_seeds', type=int, default=5,
-                        help='Number of different random seeds')
-    parser.add_argument('--episodes_per_seed', type=int, default=100,
-                        help='Number of episodes per seed')
-    parser.add_argument('--env_num', type=int, default=20,
-                        help='Number of parallel environments')
-    parser.add_argument('--max_steps', type=int, default=100,
-                        help='Maximum steps per episode')
-    parser.add_argument('--model_name', type=str, default='gpt-4o',
-                        help='Model name to use')
-    parser.add_argument('--base_seed', type=int, default=42,
-                        help='Base seed for random generation')
+        
+        logging.info("Model loaded successfully!")
+        
+    def format_prompt(self, obs):
+        """Format observation as prompt for the model"""
+        # For Qwen2.5 instruction-tuned models
+        # Uses the standard ChatML format
+        return f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{obs}<|im_end|>\n<|im_start|>assistant\n"
     
-    args = parser.parse_args()
+    def get_actions_batch(self, obs_list):
+        """Get actions for multiple observations in batch"""
+        if not obs_list:
+            return []
+        
+        # Format prompts
+        prompts = [self.format_prompt(obs) for obs in obs_list]
+        #print(prompts[0])
+         
+        # Generate in batch
+        outputs = self.llm.generate(prompts, self.sampling_params)
+        #print(outputs[0])
+        # Extract actions
+        actions = [output.outputs[0].text.strip() for output in outputs]
+        
+        return actions
 
+async def run_evaluation(args):
+    """Main evaluation loop"""
+    
     # Calculate test_times from episodes_per_seed and env_num
     test_times = args.episodes_per_seed // args.env_num
     if args.episodes_per_seed % args.env_num != 0:
@@ -102,9 +123,12 @@ if __name__ == "__main__":
 
     # -------- Logging ----------
     os.makedirs("logs/safety_gridworlds", exist_ok=True)
+    
+    # Create a safe model name for the filename
+    safe_model_name = args.model_name.replace('/', '_')
     log_fp = os.path.join(
         "logs/safety_gridworlds", 
-        f"{args.env_name}_{args.model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        f"{args.env_name}_{safe_model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     )
     logging.basicConfig(
         level=logging.INFO,
@@ -125,10 +149,16 @@ if __name__ == "__main__":
     logging.info(f"Total episodes: {args.num_seeds * test_times * args.env_num}")
     logging.info(f"Max steps per episode: {args.max_steps}")
     logging.info(f"Base seed: {args.base_seed}")
+    logging.info(f"Tensor parallel size: {args.tensor_parallel_size}")
     logging.info("="*60 + "\n")
 
     # -------- Initialize Agent ----------
-    agent = Agent(model_name=args.model_name)
+    agent = VLLMAgent(
+        model_name=args.model_name,
+        tensor_parallel_size=args.tensor_parallel_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len
+    )
 
     # Accumulated statistics across all seeds
     all_results = {
@@ -173,13 +203,27 @@ if __name__ == "__main__":
                 if step_idx % 10 == 0:  # Log every 10 steps to reduce clutter
                     logging.info(f"  Step {step_idx}/{args.max_steps}; Dones ({done_count}/{args.env_num})")
 
-                # --- Assemble actions (only for non-done environments) ---
-                actions = []
-                for i in range(args.env_num):
-                    if env_dones[i]:
-                        actions.append("None")
-                    else:
-                        actions.append(agent.get_action_from_gpt(obs["text"][i]))
+                # --- Assemble actions (batch inference for non-done environments) ---
+                active_indices = [i for i in range(args.env_num) if not env_dones[i]]
+                
+                if active_indices:
+                    # Get observations for active environments
+                    active_obs = [obs["text"][i] for i in active_indices]
+                    
+                    # Get actions in batch
+                    active_actions = agent.get_actions_batch(active_obs)
+                    
+                    # Build full action list
+                    actions = []
+                    active_idx = 0
+                    for i in range(args.env_num):
+                        if env_dones[i]:
+                            actions.append("None")
+                        else:
+                            actions.append(active_actions[active_idx])
+                            active_idx += 1
+                else:
+                    actions = ["None"] * args.env_num
 
                 # --- Environment stepping ---
                 obs, rewards, dones, infos = env_manager.step(actions)
@@ -289,3 +333,32 @@ if __name__ == "__main__":
     logging.info("="*60)
     logging.info("Evaluation complete!")
     logging.info(f"Results saved to: {log_fp}")
+
+if __name__ == "__main__":
+    # -------- Argument Parser ----------
+    parser = argparse.ArgumentParser(description='Evaluate open-source models on Safety Gridworlds using vLLM')
+    parser.add_argument('--env_name', type=str, default='AbsentSupervisor',
+                        help='Environment name (AbsentSupervisor, BoatRace, TomatoWatering, etc.)')
+    parser.add_argument('--num_seeds', type=int, default=5,
+                        help='Number of different random seeds')
+    parser.add_argument('--episodes_per_seed', type=int, default=100,
+                        help='Number of episodes per seed')
+    parser.add_argument('--env_num', type=int, default=20,
+                        help='Number of parallel environments')
+    parser.add_argument('--max_steps', type=int, default=100,
+                        help='Maximum steps per episode')
+    parser.add_argument('--model_name', type=str, default='Qwen/Qwen3-8B',
+                        help='HuggingFace model name or path')
+    parser.add_argument('--base_seed', type=int, default=42,
+                        help='Base seed for random generation')
+    parser.add_argument('--tensor_parallel_size', type=int, default=4,
+                        help='Number of GPUs for tensor parallelism')
+    parser.add_argument('--gpu_memory_utilization', type=float, default=0.9,
+                        help='Fraction of GPU memory to use (0.0-1.0)')
+    parser.add_argument('--max_model_len', type=int, default=None,
+                        help='Maximum model context length (None for default)')
+    
+    args = parser.parse_args()
+    
+    # Run evaluation
+    asyncio.run(run_evaluation(args))
