@@ -7,6 +7,7 @@ from collections import defaultdict
 from vllm import LLM, SamplingParams
 import argparse
 import asyncio
+import ray
 
 def build_env(env_name, env_num=1, seed=42):
     """Build Safety Gridworlds environment"""
@@ -339,11 +340,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Evaluate open-source models on Safety Gridworlds using vLLM')
     parser.add_argument('--env_name', type=str, default='AbsentSupervisor',
                         help='Environment name (AbsentSupervisor, BoatRace, TomatoWatering, etc.)')
-    parser.add_argument('--num_seeds', type=int, default=5,
+    parser.add_argument('--num_seeds', type=int, default=4,
                         help='Number of different random seeds')
-    parser.add_argument('--episodes_per_seed', type=int, default=100,
+    parser.add_argument('--episodes_per_seed', type=int, default=40,
                         help='Number of episodes per seed')
-    parser.add_argument('--env_num', type=int, default=20,
+    parser.add_argument('--env_num', type=int, default=10,
                         help='Number of parallel environments')
     parser.add_argument('--max_steps', type=int, default=100,
                         help='Maximum steps per episode')
@@ -358,7 +359,57 @@ if __name__ == "__main__":
     parser.add_argument('--max_model_len', type=int, default=None,
                         help='Maximum model context length (None for default)')
     
+    # Ray-specific arguments
+    parser.add_argument('--num_cpus', type=int, default=None,
+                        help='Number of CPUs for Ray (None for auto-detect)')
+    parser.add_argument('--num_gpus', type=int, default=None,
+                        help='Number of GPUs for Ray (None for auto-detect)')
+    
     args = parser.parse_args()
     
-    # Run evaluation
-    asyncio.run(run_evaluation(args))
+    # -------- Initialize Ray ----------
+    # First, shutdown any existing Ray connection
+    if ray.is_initialized():
+        print("Shutting down existing Ray connection...")
+        ray.shutdown()
+    
+    # Check if RAY_ADDRESS environment variable is set
+    ray_address_env = os.environ.get('RAY_ADDRESS')
+    
+    print("Initializing Ray...")
+    if ray_address_env:
+        print(f"RAY_ADDRESS detected: {ray_address_env}")
+        print("Connecting to existing Ray cluster (ignoring num_cpus/num_gpus)...")
+        ray.init(address='auto', ignore_reinit_error=True, log_to_driver=True)
+    else:
+        # Try to start with resources, but if it fails due to existing cluster, retry without resources
+        try:
+            print("Attempting to start new Ray head node...")
+            ray_init_kwargs = {
+                'ignore_reinit_error': True,
+                'log_to_driver': True,
+            }
+            
+            if args.num_cpus is not None:
+                ray_init_kwargs['num_cpus'] = args.num_cpus
+            if args.num_gpus is not None:
+                ray_init_kwargs['num_gpus'] = args.num_gpus
+            
+            ray.init(**ray_init_kwargs)
+        except ValueError as e:
+            if "num_cpus and num_gpus must not be provided" in str(e):
+                print("Detected existing cluster connection. Retrying without resource specifications...")
+                ray.init(ignore_reinit_error=True, log_to_driver=True)
+            else:
+                raise
+    
+    print(f"Ray initialized successfully!")
+        
+    try:
+        # Run evaluation
+        asyncio.run(run_evaluation(args))
+    finally:
+        # Shutdown Ray when done
+        if ray.is_initialized():
+            print("\nShutting down Ray...")
+            ray.shutdown()
