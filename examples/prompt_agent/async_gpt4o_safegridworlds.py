@@ -152,10 +152,11 @@ async def run_evaluation(args):
             env_dones = [False] * args.env_num
 
             # Track rewards for each environment in this round
-            cumulative_hidden_rewards = np.zeros(args.env_num)
-            cumulative_observed_rewards = np.zeros(args.env_num)
-            valid_actions_count = np.zeros(args.env_num)
-            total_actions_count = np.zeros(args.env_num)
+            # Use NaN for hidden rewards to distinguish "no data" from "zero reward"
+            cumulative_hidden_rewards = np.full(args.env_num, np.nan, dtype=np.float64)
+            cumulative_observed_rewards = np.zeros(args.env_num, dtype=np.float64)
+            valid_actions_count = np.zeros(args.env_num, dtype=np.float64)
+            total_actions_count = np.zeros(args.env_num, dtype=np.float64)
 
             for step_idx in range(args.max_steps):
                 done_count = np.array(env_dones).sum().item()
@@ -193,16 +194,24 @@ async def run_evaluation(args):
                     if env_dones[i]:
                         continue
 
-                    # Accumulate rewards
-                    hidden_reward = infos[i].get('hidden_reward', 0.0)
+                    # Get rewards from info
+                    hidden_reward = infos[i].get('hidden_reward')
                     observed_reward = infos[i].get('observed_reward', 0.0)
-                    cumulative_hidden_rewards[i] += hidden_reward
-                    cumulative_observed_rewards[i] += observed_reward
+                    
+                    # Handle hidden_reward: only accumulate if not None
+                    if hidden_reward is not None:
+                        # If this is the first non-None hidden reward, initialize to 0
+                        if np.isnan(cumulative_hidden_rewards[i]):
+                            cumulative_hidden_rewards[i] = 0.0
+                        cumulative_hidden_rewards[i] += float(hidden_reward)
+                    
+                    # Always accumulate observed reward
+                    cumulative_observed_rewards[i] += float(observed_reward)
 
                     # Track action validity
                     is_valid = infos[i].get('is_action_valid', 1)
-                    valid_actions_count[i] += is_valid
-                    total_actions_count[i] += 1
+                    valid_actions_count[i] += float(is_valid)
+                    total_actions_count[i] += 1.0
 
                     # Mark as done
                     if dones[i]:
@@ -213,15 +222,16 @@ async def run_evaluation(args):
                     break
 
             # -------- Store results from this test --------
-            action_validity_rates = valid_actions_count / np.maximum(total_actions_count, 1)
+            action_validity_rates = valid_actions_count / np.maximum(total_actions_count, 1.0)
             
-            seed_hidden_rewards.extend(cumulative_hidden_rewards)
-            seed_observed_rewards.extend(cumulative_observed_rewards)
-            seed_action_validity.extend(action_validity_rates)
+            # Convert to lists, keeping NaN for episodes without hidden rewards
+            seed_hidden_rewards.extend(cumulative_hidden_rewards.tolist())
+            seed_observed_rewards.extend(cumulative_observed_rewards.tolist())
+            seed_action_validity.extend(action_validity_rates.tolist())
 
-            # Log test statistics
+            # Log test statistics (use nanmean to ignore NaN values)
             logging.info(f"  Test completed in {time.time() - start_time:.2f}s")
-            logging.info(f"  Hidden Reward: {cumulative_hidden_rewards.mean():.4f} ± {cumulative_hidden_rewards.std():.4f}")
+            logging.info(f"  Hidden Reward: {np.nanmean(cumulative_hidden_rewards):.4f} ± {np.nanstd(cumulative_hidden_rewards):.4f}")
             logging.info(f"  Observed Reward: {cumulative_observed_rewards.mean():.4f} ± {cumulative_observed_rewards.std():.4f}")
             logging.info(f"  Action Validity: {action_validity_rates.mean():.4f}")
 
@@ -233,17 +243,17 @@ async def run_evaluation(args):
         seed_summary = {
             'seed': current_seed,
             'episodes': len(seed_hidden_rewards),
-            'hidden_reward_mean': seed_hidden_rewards.mean(),
-            'hidden_reward_std': seed_hidden_rewards.std(),
-            'observed_reward_mean': seed_observed_rewards.mean(),
-            'observed_reward_std': seed_observed_rewards.std(),
-            'action_validity_mean': seed_action_validity.mean(),
+            'hidden_reward_mean': float(np.nanmean(seed_hidden_rewards)),
+            'hidden_reward_std': float(np.nanstd(seed_hidden_rewards)),
+            'observed_reward_mean': float(seed_observed_rewards.mean()),
+            'observed_reward_std': float(seed_observed_rewards.std()),
+            'action_validity_mean': float(seed_action_validity.mean()),
         }
         
         all_results['seed_summaries'].append(seed_summary)
-        all_results['hidden_rewards'].extend(seed_hidden_rewards)
-        all_results['observed_rewards'].extend(seed_observed_rewards)
-        all_results['action_validity_rates'].extend(seed_action_validity)
+        all_results['hidden_rewards'].extend(seed_hidden_rewards.tolist())
+        all_results['observed_rewards'].extend(seed_observed_rewards.tolist())
+        all_results['action_validity_rates'].extend(seed_action_validity.tolist())
         
         logging.info(f"\n{'='*60}")
         logging.info(f"SEED {seed_idx + 1} SUMMARY (seed={current_seed})")
@@ -271,7 +281,7 @@ async def run_evaluation(args):
     action_validity_all = np.array(all_results['action_validity_rates'])
     
     logging.info("\nOVERALL STATISTICS (across all episodes):")
-    logging.info(f"  Hidden Reward: {hidden_rewards_all.mean():.4f} ± {hidden_rewards_all.std():.4f}")
+    logging.info(f"  Hidden Reward: {np.nanmean(hidden_rewards_all):.4f} ± {np.nanstd(hidden_rewards_all):.4f}")
     logging.info(f"  Observed Reward: {observed_rewards_all.mean():.4f} ± {observed_rewards_all.std():.4f}")
     logging.info(f"  Action Validity: {action_validity_all.mean():.4f} ± {action_validity_all.std():.4f}")
     
@@ -297,11 +307,11 @@ async def run_evaluation(args):
 if __name__ == "__main__":
     # -------- Argument Parser ----------
     parser = argparse.ArgumentParser(description='Evaluate GPT-4o on Safety Gridworlds')
-    parser.add_argument('--env_name', type=str, default='AbsentSupervisor',
+    parser.add_argument('--env_name', type=str, default='FriendFoe',
                         help='Environment name (AbsentSupervisor, BoatRace, TomatoWatering, etc.)')
-    parser.add_argument('--num_seeds', type=int, default=5,
+    parser.add_argument('--num_seeds', type=int, default=1,
                         help='Number of different random seeds')
-    parser.add_argument('--episodes_per_seed', type=int, default=100,
+    parser.add_argument('--episodes_per_seed', type=int, default=40,
                         help='Number of episodes per seed')
     parser.add_argument('--env_num', type=int, default=20,
                         help='Number of parallel environments')
