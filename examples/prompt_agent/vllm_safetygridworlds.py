@@ -38,7 +38,7 @@ def build_env(env_name, env_num=1, seed=42):
     class Config:
         class Env:
             env_name = _env_name
-            history_length = 100
+            history_length = 10
         env = Env()
     
     config = Config()
@@ -52,6 +52,7 @@ def build_env(env_name, env_num=1, seed=42):
     
     return env_manager
 
+
 class VLLMAgent:
     def __init__(self, model_name="Qwen/Qwen2.5-7B-Instruct", 
                  tensor_parallel_size=1,
@@ -59,12 +60,6 @@ class VLLMAgent:
                  max_model_len=None):
         """
         Initialize vLLM agent
-        
-        Args:
-            model_name: HuggingFace model name or path
-            tensor_parallel_size: Number of GPUs for tensor parallelism
-            gpu_memory_utilization: Fraction of GPU memory to use
-            max_model_len: Maximum context length (None for model default)
         """
         self.model_name = model_name
         
@@ -92,8 +87,6 @@ class VLLMAgent:
         
     def format_prompt(self, obs):
         """Format observation as prompt for the model"""
-        # For Qwen2.5 instruction-tuned models
-        # Uses the standard ChatML format
         return f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{obs}<|im_end|>\n<|im_start|>assistant\n"
     
     def get_actions_batch(self, obs_list):
@@ -101,34 +94,27 @@ class VLLMAgent:
         if not obs_list:
             return []
         
-        # Format prompts
         prompts = [self.format_prompt(obs) for obs in obs_list]
-        #print(prompts[0])
-         
-        # Generate in batch
         outputs = self.llm.generate(prompts, self.sampling_params)
-        #print(outputs[0])
-        # Extract actions
         actions = [output.outputs[0].text.strip() for output in outputs]
         
         return actions
 
+
 async def run_evaluation(args):
     """Main evaluation loop"""
     
-    # Calculate test_times from episodes_per_seed and env_num
+    # Calculate test_times
     test_times = args.episodes_per_seed // args.env_num
     if args.episodes_per_seed % args.env_num != 0:
         print(f"Warning: episodes_per_seed ({args.episodes_per_seed}) not divisible by env_num ({args.env_num})")
         print(f"Will run {test_times * args.env_num} episodes per seed instead")
 
     # -------- Logging ----------
-    os.makedirs("logs/safety_gridworlds", exist_ok=True)
-    
-    # Create a safe model name for the filename
+    os.makedirs("qwen2.5-1.5b-logs/safety_gridworlds", exist_ok=True)
     safe_model_name = args.model_name.replace('/', '_')
     log_fp = os.path.join(
-        "logs/safety_gridworlds", 
+        "qwen2.5-1.5b-logs/safety_gridworlds", 
         f"{args.env_name}_{safe_model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     )
     logging.basicConfig(
@@ -161,7 +147,7 @@ async def run_evaluation(args):
         max_model_len=args.max_model_len
     )
 
-    # Accumulated statistics across all seeds
+    # -------- Accumulated statistics ----------
     all_results = {
         'hidden_rewards': [],
         'observed_rewards': [],
@@ -169,22 +155,19 @@ async def run_evaluation(args):
         'seed_summaries': []
     }
 
-    # ======================= Main Loop: Iterate over seeds =======================
+    # ======================= Main Loop =======================
     for seed_idx in range(args.num_seeds):
         current_seed = args.base_seed + seed_idx
         logging.info(f"\n{'='*60}")
         logging.info(f"SEED {seed_idx + 1}/{args.num_seeds} (seed={current_seed})")
         logging.info(f"{'='*60}")
         
-        # Build environment with current seed
         env_manager = build_env(env_name=args.env_name, env_num=args.env_num, seed=current_seed)
         
-        # Statistics for this seed
         seed_hidden_rewards = []
         seed_observed_rewards = []
         seed_action_validity = []
 
-        # Run episodes for this seed
         for test_idx in range(test_times):
             logging.info(f"\n--- Seed {seed_idx + 1}, Test {test_idx + 1}/{test_times} ---")
             start_time = time.time()
@@ -192,29 +175,21 @@ async def run_evaluation(args):
             obs, infos = env_manager.reset({})
             env_dones = [False] * args.env_num
 
-            # Track rewards for each environment in this round
-            cumulative_hidden_rewards = np.zeros(args.env_num)
-            cumulative_observed_rewards = np.zeros(args.env_num)
-            valid_actions_count = np.zeros(args.env_num)
-            total_actions_count = np.zeros(args.env_num)
+            cumulative_hidden_rewards = np.full(args.env_num, np.nan, dtype=np.float64)
+            cumulative_observed_rewards = np.zeros(args.env_num, dtype=np.float64)
+            valid_actions_count = np.zeros(args.env_num, dtype=np.float64)
+            total_actions_count = np.zeros(args.env_num, dtype=np.float64)
 
             for step_idx in range(args.max_steps):
                 done_count = np.array(env_dones).sum().item()
-                
-                if step_idx % 10 == 0:  # Log every 10 steps to reduce clutter
+                if step_idx % 10 == 0:
                     logging.info(f"  Step {step_idx}/{args.max_steps}; Dones ({done_count}/{args.env_num})")
 
-                # --- Assemble actions (batch inference for non-done environments) ---
                 active_indices = [i for i in range(args.env_num) if not env_dones[i]]
-                
                 if active_indices:
-                    # Get observations for active environments
                     active_obs = [obs["text"][i] for i in active_indices]
-                    
-                    # Get actions in batch
                     active_actions = agent.get_actions_batch(active_obs)
                     
-                    # Build full action list
                     actions = []
                     active_idx = 0
                     for i in range(args.env_num):
@@ -226,26 +201,27 @@ async def run_evaluation(args):
                 else:
                     actions = ["None"] * args.env_num
 
-                # --- Environment stepping ---
                 obs, rewards, dones, infos = env_manager.step(actions)
 
-                # --- Accumulate rewards and track action validity ---
                 for i in range(args.env_num):
                     if env_dones[i]:
                         continue
 
-                    # Accumulate rewards
-                    hidden_reward = infos[i].get('hidden_reward', 0.0)
+                    hidden_reward = infos[i].get('hidden_reward')
                     observed_reward = infos[i].get('observed_reward', 0.0)
-                    cumulative_hidden_rewards[i] += hidden_reward
-                    cumulative_observed_rewards[i] += observed_reward
 
-                    # Track action validity
+                    # Handle hidden_reward safely (may be None)
+                    if hidden_reward is not None:
+                        if np.isnan(cumulative_hidden_rewards[i]):
+                            cumulative_hidden_rewards[i] = 0.0
+                        cumulative_hidden_rewards[i] += float(hidden_reward)
+
+                    cumulative_observed_rewards[i] += float(observed_reward)
+
                     is_valid = infos[i].get('is_action_valid', 1)
-                    valid_actions_count[i] += is_valid
-                    total_actions_count[i] += 1
+                    valid_actions_count[i] += float(is_valid)
+                    total_actions_count[i] += 1.0
 
-                    # Mark as done
                     if dones[i]:
                         env_dones[i] = True
 
@@ -253,20 +229,17 @@ async def run_evaluation(args):
                     logging.info("  All environments finished early!")
                     break
 
-            # -------- Store results from this test --------
-            action_validity_rates = valid_actions_count / np.maximum(total_actions_count, 1)
-            
-            seed_hidden_rewards.extend(cumulative_hidden_rewards)
-            seed_observed_rewards.extend(cumulative_observed_rewards)
-            seed_action_validity.extend(action_validity_rates)
+            action_validity_rates = valid_actions_count / np.maximum(total_actions_count, 1.0)
 
-            # Log test statistics
+            seed_hidden_rewards.extend(cumulative_hidden_rewards.tolist())
+            seed_observed_rewards.extend(cumulative_observed_rewards.tolist())
+            seed_action_validity.extend(action_validity_rates.tolist())
+
             logging.info(f"  Test completed in {time.time() - start_time:.2f}s")
-            logging.info(f"  Hidden Reward: {cumulative_hidden_rewards.mean():.4f} ± {cumulative_hidden_rewards.std():.4f}")
+            logging.info(f"  Hidden Reward: {np.nanmean(cumulative_hidden_rewards):.4f} ± {np.nanstd(cumulative_hidden_rewards):.4f}")
             logging.info(f"  Observed Reward: {cumulative_observed_rewards.mean():.4f} ± {cumulative_observed_rewards.std():.4f}")
             logging.info(f"  Action Validity: {action_validity_rates.mean():.4f}")
 
-        # -------- Seed Summary --------
         seed_hidden_rewards = np.array(seed_hidden_rewards)
         seed_observed_rewards = np.array(seed_observed_rewards)
         seed_action_validity = np.array(seed_action_validity)
@@ -274,17 +247,17 @@ async def run_evaluation(args):
         seed_summary = {
             'seed': current_seed,
             'episodes': len(seed_hidden_rewards),
-            'hidden_reward_mean': seed_hidden_rewards.mean(),
-            'hidden_reward_std': seed_hidden_rewards.std(),
-            'observed_reward_mean': seed_observed_rewards.mean(),
-            'observed_reward_std': seed_observed_rewards.std(),
-            'action_validity_mean': seed_action_validity.mean(),
+            'hidden_reward_mean': float(np.nanmean(seed_hidden_rewards)),
+            'hidden_reward_std': float(np.nanstd(seed_hidden_rewards)),
+            'observed_reward_mean': float(seed_observed_rewards.mean()),
+            'observed_reward_std': float(seed_observed_rewards.std()),
+            'action_validity_mean': float(seed_action_validity.mean()),
         }
         
         all_results['seed_summaries'].append(seed_summary)
-        all_results['hidden_rewards'].extend(seed_hidden_rewards)
-        all_results['observed_rewards'].extend(seed_observed_rewards)
-        all_results['action_validity_rates'].extend(seed_action_validity)
+        all_results['hidden_rewards'].extend(seed_hidden_rewards.tolist())
+        all_results['observed_rewards'].extend(seed_observed_rewards.tolist())
+        all_results['action_validity_rates'].extend(seed_action_validity.tolist())
         
         logging.info(f"\n{'='*60}")
         logging.info(f"SEED {seed_idx + 1} SUMMARY (seed={current_seed})")
@@ -306,24 +279,21 @@ async def run_evaluation(args):
     logging.info(f"Total episodes: {len(all_results['hidden_rewards'])}")
     logging.info("-"*60)
     
-    # Overall statistics
     hidden_rewards_all = np.array(all_results['hidden_rewards'])
     observed_rewards_all = np.array(all_results['observed_rewards'])
     action_validity_all = np.array(all_results['action_validity_rates'])
     
     logging.info("\nOVERALL STATISTICS (across all episodes):")
-    logging.info(f"  Hidden Reward: {hidden_rewards_all.mean():.4f} ± {hidden_rewards_all.std():.4f}")
+    logging.info(f"  Hidden Reward: {np.nanmean(hidden_rewards_all):.4f} ± {np.nanstd(hidden_rewards_all):.4f}")
     logging.info(f"  Observed Reward: {observed_rewards_all.mean():.4f} ± {observed_rewards_all.std():.4f}")
     logging.info(f"  Action Validity: {action_validity_all.mean():.4f} ± {action_validity_all.std():.4f}")
     
-    # Per-seed statistics
     logging.info("\nPER-SEED BREAKDOWN:")
     for i, summary in enumerate(all_results['seed_summaries']):
         logging.info(f"  Seed {i+1} (seed={summary['seed']}): "
-                    f"Hidden={summary['hidden_reward_mean']:.2f}±{summary['hidden_reward_std']:.2f}, "
-                    f"Observed={summary['observed_reward_mean']:.2f}±{summary['observed_reward_std']:.2f}")
+                     f"Hidden={summary['hidden_reward_mean']:.2f}±{summary['hidden_reward_std']:.2f}, "
+                     f"Observed={summary['observed_reward_mean']:.2f}±{summary['observed_reward_std']:.2f}")
     
-    # Compute statistics across seeds (mean of means)
     seed_means_hidden = [s['hidden_reward_mean'] for s in all_results['seed_summaries']]
     seed_means_observed = [s['observed_reward_mean'] for s in all_results['seed_summaries']]
     
@@ -335,45 +305,29 @@ async def run_evaluation(args):
     logging.info("Evaluation complete!")
     logging.info(f"Results saved to: {log_fp}")
 
+
 if __name__ == "__main__":
-    # -------- Argument Parser ----------
     parser = argparse.ArgumentParser(description='Evaluate open-source models on Safety Gridworlds using vLLM')
-    parser.add_argument('--env_name', type=str, default='AbsentSupervisor',
-                        help='Environment name (AbsentSupervisor, BoatRace, TomatoWatering, etc.)')
-    parser.add_argument('--num_seeds', type=int, default=4,
-                        help='Number of different random seeds')
-    parser.add_argument('--episodes_per_seed', type=int, default=40,
-                        help='Number of episodes per seed')
-    parser.add_argument('--env_num', type=int, default=10,
-                        help='Number of parallel environments')
-    parser.add_argument('--max_steps', type=int, default=100,
-                        help='Maximum steps per episode')
-    parser.add_argument('--model_name', type=str, default='Qwen/Qwen3-8B',
-                        help='HuggingFace model name or path')
-    parser.add_argument('--base_seed', type=int, default=42,
-                        help='Base seed for random generation')
-    parser.add_argument('--tensor_parallel_size', type=int, default=4,
-                        help='Number of GPUs for tensor parallelism')
-    parser.add_argument('--gpu_memory_utilization', type=float, default=0.9,
-                        help='Fraction of GPU memory to use (0.0-1.0)')
-    parser.add_argument('--max_model_len', type=int, default=None,
-                        help='Maximum model context length (None for default)')
-    
-    # Ray-specific arguments
-    parser.add_argument('--num_cpus', type=int, default=None,
-                        help='Number of CPUs for Ray (None for auto-detect)')
-    parser.add_argument('--num_gpus', type=int, default=None,
-                        help='Number of GPUs for Ray (None for auto-detect)')
+    parser.add_argument('--env_name', type=str, default='AbsentSupervisor')
+    parser.add_argument('--num_seeds', type=int, default=5)
+    parser.add_argument('--episodes_per_seed', type=int, default=20)
+    parser.add_argument('--env_num', type=int, default=10)
+    parser.add_argument('--max_steps', type=int, default=100)
+    parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-3B')
+    parser.add_argument('--base_seed', type=int, default=42)
+    parser.add_argument('--tensor_parallel_size', type=int, default=1)
+    parser.add_argument('--gpu_memory_utilization', type=float, default=0.9)
+    parser.add_argument('--max_model_len', type=int, default=None)
+    parser.add_argument('--num_cpus', type=int, default=None)
+    parser.add_argument('--num_gpus', type=int, default=None)
     
     args = parser.parse_args()
     
     # -------- Initialize Ray ----------
-    # First, shutdown any existing Ray connection
     if ray.is_initialized():
         print("Shutting down existing Ray connection...")
         ray.shutdown()
     
-    # Check if RAY_ADDRESS environment variable is set
     ray_address_env = os.environ.get('RAY_ADDRESS')
     
     print("Initializing Ray...")
@@ -382,19 +336,16 @@ if __name__ == "__main__":
         print("Connecting to existing Ray cluster (ignoring num_cpus/num_gpus)...")
         ray.init(address='auto', ignore_reinit_error=True, log_to_driver=True)
     else:
-        # Try to start with resources, but if it fails due to existing cluster, retry without resources
         try:
             print("Attempting to start new Ray head node...")
             ray_init_kwargs = {
                 'ignore_reinit_error': True,
                 'log_to_driver': True,
             }
-            
             if args.num_cpus is not None:
                 ray_init_kwargs['num_cpus'] = args.num_cpus
             if args.num_gpus is not None:
                 ray_init_kwargs['num_gpus'] = args.num_gpus
-            
             ray.init(**ray_init_kwargs)
         except ValueError as e:
             if "num_cpus and num_gpus must not be provided" in str(e):
@@ -403,13 +354,12 @@ if __name__ == "__main__":
             else:
                 raise
     
-    print(f"Ray initialized successfully!")
+    print("Ray initialized successfully!")
         
     try:
-        # Run evaluation
         asyncio.run(run_evaluation(args))
     finally:
-        # Shutdown Ray when done
         if ray.is_initialized():
             print("\nShutting down Ray...")
             ray.shutdown()
+
