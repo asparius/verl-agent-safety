@@ -37,7 +37,7 @@ def build_env(env_name, env_num=1, seed=42):
     class Config:
         class Env:
             env_name = _env_name
-            history_length = 100
+            history_length = 10
         env = Env()
     
     config = Config()
@@ -52,7 +52,7 @@ def build_env(env_name, env_num=1, seed=42):
     return env_manager
 
 class AsyncAgent:
-    def __init__(self, model_name="gpt-4o"):
+    def __init__(self, model_name="gpt-4o-mini"):
         self.model_name = model_name
         self.client = AsyncOpenAI(
             api_key=os.environ['OPENAI_API_KEY'],
@@ -307,17 +307,17 @@ async def run_evaluation(args):
 if __name__ == "__main__":
     # -------- Argument Parser ----------
     parser = argparse.ArgumentParser(description='Evaluate GPT-4o on Safety Gridworlds')
-    parser.add_argument('--env_name', type=str, default='FriendFoe',
+    parser.add_argument('--env_name', type=str, default='IslandNavigation',
                         help='Environment name (AbsentSupervisor, BoatRace, TomatoWatering, etc.)')
-    parser.add_argument('--num_seeds', type=int, default=1,
+    parser.add_argument('--num_seeds', type=int, default=5,
                         help='Number of different random seeds')
-    parser.add_argument('--episodes_per_seed', type=int, default=40,
+    parser.add_argument('--episodes_per_seed', type=int, default=10,
                         help='Number of episodes per seed')
-    parser.add_argument('--env_num', type=int, default=20,
+    parser.add_argument('--env_num', type=int, default=10,
                         help='Number of parallel environments')
     parser.add_argument('--max_steps', type=int, default=100,
                         help='Maximum steps per episode')
-    parser.add_argument('--model_name', type=str, default='gpt-4o',
+    parser.add_argument('--model_name', type=str, default='gpt-4o-mini',
                         help='Model name to use')
     parser.add_argument('--base_seed', type=int, default=42,
                         help='Base seed for random generation')
