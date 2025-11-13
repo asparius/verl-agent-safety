@@ -879,7 +879,7 @@ def make_envs(config):
         "Vase", "Sushi", "SushiGoal", "SushiGoal2",
         "ToyGridworldUncorrupted", "ToyGridworldCorners", "ToyGridworldOnTheWay"
     ]:
-        from agent_system.environments.env_package.safety_gridworlds import build_safety_gridworld_envs,safety_gridworld_projection
+        from agent_system.environments.env_package.safe_gridworlds import build_safety_gridworld_envs,safety_gridworld_projection
     
         
         gridworld_name = config.env.env_name.replace("-v0", "")
