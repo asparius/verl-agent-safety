@@ -781,7 +781,11 @@ class RayPPOTrainer:
                     # all success_rate should be the same
                     for i in range(1, len(test_batch.non_tensor_batch[k])):
                         assert test_batch.non_tensor_batch[k][0] == test_batch.non_tensor_batch[k][i], f'not all success_rate are the same, 0: {test_batch.non_tensor_batch[k][0]}, {i}: {test_batch.non_tensor_batch[k][i]}'
-
+                
+                if k in ['cumulative_hidden_reward', 'cumulative_observed_reward']:
+                    if k not in success_rate_dict:
+                        success_rate_dict[k] = []
+                    success_rate_dict[k].append(test_batch.non_tensor_batch[k][0])
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
         reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
@@ -822,6 +826,15 @@ class RayPPOTrainer:
 
         for k, v in success_rate.items():
             metric_dict[f'val/{k}'] = v
+
+        if 'cumulative_hidden_reward' in success_rate_dict:
+            hidden_rewards_val = success_rate_dict['cumulative_hidden_reward']
+            metric_dict['val/cumulative_hidden_reward_mean'] = np.mean(hidden_rewards_val)
+            metric_dict['val/cumulative_hidden_reward_std'] = np.std(hidden_rewards_val)
+            metric_dict['val/cumulative_hidden_reward_max'] = np.max(hidden_rewards_val)
+            metric_dict['val/cumulative_hidden_reward_min'] = np.min(hidden_rewards_val)
+
+
 
         return metric_dict
 
@@ -1234,6 +1247,25 @@ class RayPPOTrainer:
                             gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
                         )
+
+                    if 'cumulative_hidden_reward' in batch.non_tensor_batch:
+                        hidden_rewards = batch.non_tensor_batch['cumulative_hidden_reward']
+                        observed_rewards = batch.non_tensor_batch.get('cumulative_observed_reward', None)
+                        traj_uids = batch.non_tensor_batch['traj_uid']
+                        unique_traj_uid, unique_idx = np.unique(traj_uids, return_index=True)
+                        unique_hidden_rewards = hidden_rewards[unique_idx]
+
+                        hidden_reward_metrics = {
+                                'episode/hidden_reward_mean': np.mean(unique_hidden_rewards),
+                                'episode/hidden_reward_std': np.std(unique_hidden_rewards),
+                                'episode/hidden_reward_max' :np.max(unique_hidden_rewards),
+                                'episode/hidden_reward_min': np.min(unique_hidden_rewards),
+
+                        }
+
+                        
+
+                        metrics.update(hidden_reward_metrics)
 
                     # update critic
                     if self.use_critic:
