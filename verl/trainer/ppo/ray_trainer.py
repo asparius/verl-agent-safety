@@ -692,6 +692,8 @@ class RayPPOTrainer:
         tool_calling_list = []
         traj_uid_list = []
         success_rate_dict = {}
+        hidden_reward_list = []
+        observed_reward_list = []
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -710,7 +712,6 @@ class RayPPOTrainer:
 
             # Store original inputs
             input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
 
@@ -738,29 +739,21 @@ class RayPPOTrainer:
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            # # pad to be divisible by dp_size
-            # test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            # test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-
-            # # unpad
-            # test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-
             ################ agent-environment loop ###############
             test_output_gen_batch = self.traj_collector.multi_turn_loop(
-                                                    gen_batch=test_gen_batch,
-                                                    actor_rollout_wg=self.actor_rollout_wg,
-                                                    envs=self.val_envs,
-                                                    is_train=False,
-                                                    )
+                gen_batch=test_gen_batch,
+                actor_rollout_wg=self.actor_rollout_wg,
+                envs=self.val_envs,
+                is_train=False,
+            )
             print('validation generation end')
             del test_batch
             test_batch = test_output_gen_batch
+            
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
-
-            # test_batch = test_batch.union(test_output_gen_batch)
 
             # evaluate using reward_function
             result = self.val_reward_fn(test_batch, return_dict=True)
@@ -772,7 +765,15 @@ class RayPPOTrainer:
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
             tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
             traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
-            # success rate
+            
+            # Collect hidden and observed rewards if available
+            if 'cumulative_hidden_reward' in test_batch.non_tensor_batch:
+                hidden_reward_list.append(test_batch.non_tensor_batch['cumulative_hidden_reward'])
+            
+            if 'cumulative_observed_reward' in test_batch.non_tensor_batch:
+                observed_reward_list.append(test_batch.non_tensor_batch['cumulative_observed_reward'])
+            
+            # Collect success rate metrics (excluding cumulative rewards)
             for k in test_batch.non_tensor_batch.keys():
                 if 'success_rate' in k:
                     if k not in success_rate_dict:
@@ -780,18 +781,17 @@ class RayPPOTrainer:
                     success_rate_dict[k].append(test_batch.non_tensor_batch[k][0])
                     # all success_rate should be the same
                     for i in range(1, len(test_batch.non_tensor_batch[k])):
-                        assert test_batch.non_tensor_batch[k][0] == test_batch.non_tensor_batch[k][i], f'not all success_rate are the same, 0: {test_batch.non_tensor_batch[k][0]}, {i}: {test_batch.non_tensor_batch[k][i]}'
-                
-                if k in ['cumulative_hidden_reward', 'cumulative_observed_reward']:
-                    if k not in success_rate_dict:
-                        success_rate_dict[k] = []
-                    success_rate_dict[k].append(test_batch.non_tensor_batch[k][0])
+                        assert test_batch.non_tensor_batch[k][0] == test_batch.non_tensor_batch[k][i], \
+                            f'not all success_rate are the same, 0: {test_batch.non_tensor_batch[k][0]}, {i}: {test_batch.non_tensor_batch[k][i]}'
+
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
         reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
         tool_callings = np.concatenate(tool_calling_list, axis=0)
         traj_uids = np.concatenate(traj_uid_list, axis=0)
+        
+        # Compute mean for regular success_rate metrics
         success_rate = {k: np.mean(v) for k, v in success_rate_dict.items()}
 
         # evaluate test_score based on data source
@@ -803,7 +803,8 @@ class RayPPOTrainer:
             data_source_reward[data_source].append(reward_tensor[i].item())
 
         # evaluate tool call based on data source
-        # the values in tool_callings represent the tool call count for each trajectory; however, since the batch is expanded by step, we only need to take one value for each unique trajectories.
+        # the values in tool_callings represent the tool call count for each trajectory
+        # since the batch is expanded by step, we only need to take one value for each unique trajectory
         data_source_tool_calling = {}
         unique_traj_uid, unique_idx = np.unique(traj_uids, return_index=True)
         unique_data_sources = data_sources[unique_idx]
@@ -816,6 +817,8 @@ class RayPPOTrainer:
             data_source_tool_calling[data_source].append(unique_tool_callings[i].item())
 
         metric_dict = {}
+        
+        # Add data source metrics
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/{data_source}/test_score'] = np.mean(rewards)
 
@@ -824,17 +827,29 @@ class RayPPOTrainer:
             metric_dict[f'val/{data_source}/tool_call_count/max'] = np.max(tool_calls)
             metric_dict[f'val/{data_source}/tool_call_count/min'] = np.min(tool_calls)
 
+        # Add success rate metrics
         for k, v in success_rate.items():
             metric_dict[f'val/{k}'] = v
 
-        if 'cumulative_hidden_reward' in success_rate_dict:
-            hidden_rewards_val = success_rate_dict['cumulative_hidden_reward']
-            metric_dict['val/cumulative_hidden_reward_mean'] = np.mean(hidden_rewards_val)
-            metric_dict['val/cumulative_hidden_reward_std'] = np.std(hidden_rewards_val)
-            metric_dict['val/cumulative_hidden_reward_max'] = np.max(hidden_rewards_val)
-            metric_dict['val/cumulative_hidden_reward_min'] = np.min(hidden_rewards_val)
+        # Handle hidden rewards properly with unique trajectories
+        if hidden_reward_list:
+            all_hidden_rewards = np.concatenate(hidden_reward_list, axis=0)
+            unique_hidden_rewards = all_hidden_rewards[unique_idx]
+            
+            metric_dict['val/cumulative_hidden_reward_mean'] = np.mean(unique_hidden_rewards)
+            metric_dict['val/cumulative_hidden_reward_std'] = np.std(unique_hidden_rewards)
+            metric_dict['val/cumulative_hidden_reward_max'] = np.max(unique_hidden_rewards)
+            metric_dict['val/cumulative_hidden_reward_min'] = np.min(unique_hidden_rewards)
 
-
+        # Handle observed rewards properly with unique trajectories
+        if observed_reward_list:
+            all_observed_rewards = np.concatenate(observed_reward_list, axis=0)
+            unique_observed_rewards = all_observed_rewards[unique_idx]
+            
+            metric_dict['val/cumulative_observed_reward_mean'] = np.mean(unique_observed_rewards)
+            metric_dict['val/cumulative_observed_reward_std'] = np.std(unique_observed_rewards)
+            metric_dict['val/cumulative_observed_reward_max'] = np.max(unique_observed_rewards)
+            metric_dict['val/cumulative_observed_reward_min'] = np.min(unique_observed_rewards)
 
         return metric_dict
 
@@ -1084,20 +1099,13 @@ class RayPPOTrainer:
                 with _timer("step", timing_raw):
                     # generate a batch
                     with _timer("gen", timing_raw):
-                        # if not self.async_rollout_mode:
-                        #     gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                        # else:
-                        #     self.async_rollout_manager.wake_up()
-                        #     gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-                        #     self.async_rollout_manager.sleep()
-
                         ################ agent-environment loop ###############
                         gen_batch_output = self.traj_collector.multi_turn_loop(
-                                                                gen_batch=gen_batch,
-                                                                actor_rollout_wg=self.actor_rollout_wg,
-                                                                envs=self.envs,
-                                                                is_train=True,
-                                                                )
+                            gen_batch=gen_batch,
+                            actor_rollout_wg=self.actor_rollout_wg,
+                            envs=self.envs,
+                            is_train=True,
+                        )
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
@@ -1114,10 +1122,6 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    # batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
-                    # # repeat to align with repeated responses in rollout
-                    # batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    # batch = batch.union(gen_batch_output)
                     del batch
                     batch = gen_batch_output
 
@@ -1248,6 +1252,7 @@ class RayPPOTrainer:
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
                         )
 
+                    # Log hidden rewards if available
                     if 'cumulative_hidden_reward' in batch.non_tensor_batch:
                         hidden_rewards = batch.non_tensor_batch['cumulative_hidden_reward']
                         observed_rewards = batch.non_tensor_batch.get('cumulative_observed_reward', None)
@@ -1256,16 +1261,24 @@ class RayPPOTrainer:
                         unique_hidden_rewards = hidden_rewards[unique_idx]
 
                         hidden_reward_metrics = {
-                                'episode/hidden_reward_mean': np.mean(unique_hidden_rewards),
-                                'episode/hidden_reward_std': np.std(unique_hidden_rewards),
-                                'episode/hidden_reward_max' :np.max(unique_hidden_rewards),
-                                'episode/hidden_reward_min': np.min(unique_hidden_rewards),
-
+                            'episode/hidden_reward_mean': np.mean(unique_hidden_rewards),
+                            'episode/hidden_reward_std': np.std(unique_hidden_rewards),
+                            'episode/hidden_reward_max': np.max(unique_hidden_rewards),
+                            'episode/hidden_reward_min': np.min(unique_hidden_rewards),
                         }
 
-                        
-
                         metrics.update(hidden_reward_metrics)
+                        
+                        # Log observed rewards if available
+                        if observed_rewards is not None:
+                            unique_observed_rewards = observed_rewards[unique_idx]
+                            observed_reward_metrics = {
+                                'episode/observed_reward_mean': np.mean(unique_observed_rewards),
+                                'episode/observed_reward_std': np.std(unique_observed_rewards),
+                                'episode/observed_reward_max': np.max(unique_observed_rewards),
+                                'episode/observed_reward_min': np.min(unique_observed_rewards),
+                            }
+                            metrics.update(observed_reward_metrics)
 
                     # update critic
                     if self.use_critic:

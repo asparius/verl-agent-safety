@@ -1,4 +1,4 @@
-# Copyright 2025 Nanyang Technological University (NTU), Singapore
+ # Copyright 2025 Nanyang Technological University (NTU), Singapore
 # and the verl-agent (GiGPO) team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -230,6 +230,8 @@ class TrajectoryCollector:
             success: Dict[str, np.ndarray],
             traj_uid: np.ndarray,
             tool_callings: np.ndarray,
+            hidden_rewards: np.ndarray = None,
+            observed_rewards: np.ndarray = None,
             ) -> DataProto:
         """
         Collect and organize trajectory data, handling batch size adjustments to meet parallel training requirements.
@@ -241,6 +243,8 @@ class TrajectoryCollector:
             success (Dict[str, np.ndarray]): Success samples for each environment
             traj_uid (np.ndarray): Trajectory unique identifiers
             tool_callings (np.ndarray): Number of tool callings for each environment
+            hidden_rewards (np.ndarray): Cumulative hidden rewards for each environment
+            observed_rewards (np.ndarray): Cumulative observed rewards for each environment
         Returns:
             DataProto: Collected and organized trajectory data
         """
@@ -265,6 +269,14 @@ class TrajectoryCollector:
                     # success_rate
                     for key, value in success_rate.items():
                         data[key] = value
+                    
+                    # Add hidden rewards if available
+                    if hidden_rewards is not None:
+                        data['cumulative_hidden_reward'] = hidden_rewards[bs]
+                    
+                    # Add observed rewards if available
+                    if observed_rewards is not None:
+                        data['cumulative_observed_reward'] = observed_rewards[bs]
 
                     effective_batch.append(data)
             
@@ -293,6 +305,8 @@ class TrajectoryCollector:
             episode_lengths (np.ndarray): Total steps for each environment
             success (Dict[str, np.ndarray]): Success samples for each environment
             traj_uid (np.ndarray): Trajectory unique identifiers
+            hidden_rewards (np.ndarray): Cumulative hidden rewards for each environment
+            observed_rewards (np.ndarray): Cumulative observed rewards for each environment
         """
 
         batch_size = len(gen_batch.batch)
@@ -320,6 +334,13 @@ class TrajectoryCollector:
         episode_lengths = np.zeros(batch_size, dtype=np.float32)
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
         tool_callings = np.zeros(batch_size, dtype=np.float32)
+        
+        # Initialize hidden and observed reward accumulators
+        hidden_rewards = np.zeros(batch_size, dtype=np.float32)
+        observed_rewards = np.zeros(batch_size, dtype=np.float32)
+        has_hidden_rewards = False
+        has_observed_rewards = False
+        
         # Trajectory collection loop
         for _step in range(self.config.env.max_steps):
             active_masks = np.logical_not(is_done)
@@ -370,6 +391,19 @@ class TrajectoryCollector:
 
             if 'tool_calling' in infos[0]:
                 tool_callings[active_masks] += np.array([info['tool_calling'] for info in infos], dtype=np.float32)[active_masks]
+            
+            # Extract and accumulate hidden rewards if available
+            if 'hidden_reward' in infos[0]:
+                has_hidden_rewards = True
+                step_hidden_rewards = np.array([info['hidden_reward'] for info in infos], dtype=np.float32)
+                hidden_rewards[active_masks] += step_hidden_rewards[active_masks]
+            
+            # Extract and accumulate observed rewards if available
+            if 'observed_reward' in infos[0]:
+                has_observed_rewards = True
+                step_observed_rewards = np.array([info['observed_reward'] for info in infos], dtype=np.float32)
+                observed_rewards[active_masks] += step_observed_rewards[active_masks]
+            
             # Create reward tensor, only assign rewards for active environments
             # episode_rewards += torch_to_numpy(rewards) * torch_to_numpy(active_masks)
             episode_rewards[active_masks] += torch_to_numpy(rewards)[active_masks]
@@ -403,7 +437,11 @@ class TrajectoryCollector:
                     episode_lengths=episode_lengths,
                     )
         
-        return total_batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings
+        # Return None for rewards that weren't collected
+        return_hidden_rewards = hidden_rewards if has_hidden_rewards else None
+        return_observed_rewards = observed_rewards if has_observed_rewards else None
+        
+        return total_batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings, return_hidden_rewards, return_observed_rewards
     
     def dynamic_multi_turn_loop(
             self,
@@ -427,6 +465,8 @@ class TrajectoryCollector:
             total_episode_lengths (np.ndarray): Lengths per episode.
             total_success (Dict[str, np.ndarray]): Success metrics.
             total_traj_uid (np.ndarray): Trajectory IDs.
+            total_hidden_rewards (np.ndarray): Cumulative hidden rewards.
+            total_observed_rewards (np.ndarray): Cumulative observed rewards.
         """
         total_batch_list = []
         total_episode_rewards = []
@@ -434,6 +474,8 @@ class TrajectoryCollector:
         total_success = []
         total_traj_uid = []
         total_tool_callings = []
+        total_hidden_rewards = []
+        total_observed_rewards = []
         try_count: int = 0
         max_try_count = self.config.algorithm.filter_groups.max_num_gen_batches
 
@@ -443,7 +485,7 @@ class TrajectoryCollector:
                 print(f"valid num={len(total_batch_list)} < target num={self.config.data.train_batch_size * self.config.env.rollout.n}. Keep generating... ({try_count}/{max_try_count})")
             try_count += 1
 
-            batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings = self.vanilla_multi_turn_loop(
+            batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings, hidden_rewards, observed_rewards = self.vanilla_multi_turn_loop(
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
                 envs=envs,
@@ -464,14 +506,23 @@ class TrajectoryCollector:
             total_success.append(success)
             total_traj_uid.append(traj_uid)
             total_tool_callings.append(tool_callings)
+            
+            if hidden_rewards is not None:
+                total_hidden_rewards.append(hidden_rewards)
+            if observed_rewards is not None:
+                total_observed_rewards.append(observed_rewards)
 
         total_episode_rewards = np.concatenate(total_episode_rewards, axis=0)
         total_episode_lengths = np.concatenate(total_episode_lengths, axis=0)
         total_success = {key: np.concatenate([success[key] for success in total_success], axis=0) for key in total_success[0].keys()}
         total_traj_uid = np.concatenate(total_traj_uid, axis=0)
         total_tool_callings = np.concatenate(total_tool_callings, axis=0)
+        
+        # Concatenate hidden and observed rewards if they were collected
+        final_hidden_rewards = np.concatenate(total_hidden_rewards, axis=0) if total_hidden_rewards else None
+        final_observed_rewards = np.concatenate(total_observed_rewards, axis=0) if total_observed_rewards else None
 
-        return total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, total_tool_callings
+        return total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, total_tool_callings, final_hidden_rewards, final_observed_rewards
 
     def multi_turn_loop(
             self,
@@ -498,7 +549,7 @@ class TrajectoryCollector:
         # Initial observations from the environment
         if self.config.algorithm.filter_groups.enable and is_train:
             # Dynamic Sampling (for DAPO and Dynamic GiGPO)
-            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = \
+            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, total_tool_callings, total_hidden_rewards, total_observed_rewards = \
                 self.dynamic_multi_turn_loop(
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
@@ -506,7 +557,7 @@ class TrajectoryCollector:
             )
         else:
             # Vanilla Sampling   
-            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = \
+            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, total_tool_callings, total_hidden_rewards, total_observed_rewards = \
                 self.vanilla_multi_turn_loop(
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
@@ -515,7 +566,7 @@ class TrajectoryCollector:
         assert len(total_batch_list) == len(total_episode_rewards)
         assert len(total_batch_list) == len(total_episode_lengths)
         assert len(total_batch_list) == len(total_traj_uid)
-        assert len(total_batch_list) == len(totoal_tool_callings)
+        assert len(total_batch_list) == len(total_tool_callings)
         
 
         # Create trajectory data
@@ -525,7 +576,9 @@ class TrajectoryCollector:
             episode_lengths=total_episode_lengths,
             success=total_success,
             traj_uid=total_traj_uid,
-            tool_callings=totoal_tool_callings,
+            tool_callings=total_tool_callings,
+            hidden_rewards=total_hidden_rewards,
+            observed_rewards=total_observed_rewards,
         )
         
-        return gen_batch_output
+        return gen_batch_output  
