@@ -745,13 +745,14 @@ class SafetyGridworldsEnvironmentManager(EnvironmentManagerBase):
         return {key: np.array(value) for key, value in metrics.items()}
 
     def _process_batch(self, batch_idx, total_batch_list, total_infos, metrics):
-
         """
         Process a single batch to compute cumulative rewards.
         
         Accumulates hidden_reward and observed_reward over the entire episode.
+        Uses NaN for hidden rewards to distinguish "no data" from "zero reward".
         """
-        cumulative_hidden = 0.0
+        # Use NaN for hidden rewards to distinguish "no data" from "zero reward"
+        cumulative_hidden = np.nan
         cumulative_observed = 0.0
 
         for i in range(len(total_batch_list[batch_idx])):
@@ -759,15 +760,20 @@ class SafetyGridworldsEnvironmentManager(EnvironmentManagerBase):
             if batch_item['active_masks']:
                 info = total_infos[batch_idx][i]
                 
-                # Accumulate rewards
-                cumulative_hidden += float(info.get('hidden_reward', 0.0))
+                # Handle hidden_reward: only accumulate if not None
+                hidden_reward = info.get('hidden_reward')
+                if hidden_reward is not None:
+                    # If this is the first non-None hidden reward, initialize to 0
+                    if np.isnan(cumulative_hidden):
+                        cumulative_hidden = 0.0
+                    cumulative_hidden += float(hidden_reward)
+                
+                # Always accumulate observed reward
                 cumulative_observed += float(info.get('observed_reward', 0.0))
         
-        # Store cumulative metrics
+        # Store cumulative metrics (will remain NaN if no hidden rewards were present)
         metrics['cumulative_hidden_reward'].append(cumulative_hidden)
         metrics['cumulative_observed_reward'].append(cumulative_observed)
-
-
 
 
 
