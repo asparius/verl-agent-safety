@@ -29,5 +29,5 @@ tqdm==4.67.1
 transformers==4.55.2
 triton==3.4.0
 wandb==0.22.2
-vllm==0.11.0
+#vllm==0.11.0
 xformers==0.0.32.post1
